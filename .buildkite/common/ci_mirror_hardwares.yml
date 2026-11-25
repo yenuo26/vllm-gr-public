@@ -4,11 +4,46 @@
 mirror_hardwares:
   l4_1:
     agents:
-      queue: gpu_1_queue
+      queue: l4-k8s
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 1
+        - exit_status: 128
+          limit: 1
+        - signal_reason: agent_stop
+          limit: 1
+        - signal_reason: agent_refused
+          limit: 1
     plugins:
-      - docker#v5.2.0:
-          image: "${VLLM_GR_CI_IMAGE_REPOSITORY:-public.ecr.aws/q9t5s3a7/vllm-ci-test-repo}:vllm-gr-${BUILDKITE_COMMIT?}"
-          entrypoint: ""
-          gpus: all
-          shm-size: 8g
-          chown: true
+      - kubernetes:
+          metadata:
+            annotations:
+              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+              karpenter.sh/do-not-disrupt: "true"
+          podSpec:
+            priorityClassName: ci
+            serviceAccountName: buildkite-gpu-jobs
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            nodeSelector:
+              vllm.ci/gpu-pool: l4x4
+            containers:
+              - image: "${VLLM_GR_CI_IMAGE_REPOSITORY:-public.ecr.aws/q9t5s3a7/vllm-ci-test-repo}:vllm-gr-${BUILDKITE_COMMIT?}"
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                  requests:
+                    nvidia.com/gpu: 1
+                    cpu: "10"
+                    memory: 40Gi
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 24Gi

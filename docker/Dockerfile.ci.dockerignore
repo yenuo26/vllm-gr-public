@@ -8,6 +8,7 @@
 !MANIFEST.in
 !pyproject.toml
 !setup.py
+!tools/packaging/git_version.py
 !requirements/
 !vllm_gr/
 !benchmarks/open_one_rec/

@@ -18,7 +18,7 @@ if [[ "$repository" == public.ecr.aws/* ]]; then
 fi
 
 cache_key="$(sha256sum "$dockerfile" "${dockerfile}.dockerignore" pyproject.toml setup.py \
-  requirements/*.txt | sha256sum | cut -c1-16)"
+  tools/packaging/git_version.py requirements/*.txt | sha256sum | cut -c1-16)"
 cache_ref="${repository}:vllm-gr-deps-cache-${cache_key}"
 echo "Building ${image} with cache ${cache_ref}"
 

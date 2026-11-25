@@ -6,6 +6,7 @@ FROM vllm/vllm-openai:v0.30.0
 WORKDIR /opt/vllm-gr
 COPY LICENSE NOTICE README.md MANIFEST.in pyproject.toml setup.py ./
 COPY requirements/ requirements/
+COPY tools/packaging/git_version.py tools/packaging/git_version.py
 COPY benchmarks/open_one_rec/ benchmarks/open_one_rec/
 COPY vllm_gr/ vllm_gr/
 RUN VLLM_GR_TARGET_DEVICE=cuda python3 -m pip install --no-cache-dir '.[dev,grpc]'

@@ -2,6 +2,34 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 steps:
+  - label: "Beam V1 performance A/B"
+    key: beam-v1-performance-ab
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 180
+    mirror_hardwares: l4_1
+    env:
+      V1_PERF_OUTPUT_DIR: v1_performance_results
+    command: |-
+      bash -euo pipefail <<'BASH'
+      V1_PERF_BASELINE_DIR="$(python3 .buildkite/common/scripts/find-beam-v1-baseline.py /tmp)"
+      export V1_PERF_BASELINE_DIR
+      pytest --run-slow -sv \
+        'tests/e2e/test_beam_v1_performance.py::test_beam_v1_performance[compare]'
+      BASH
+    artifact_paths: "v1_performance_results/**/*"
+
+  - label: "Decode benchmark"
+    key: decode-benchmark
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 360
+    mirror_hardwares: l4_1
+    env:
+      V1_RECALL_OUTPUT_DIR: v1_recall_results
+    command: >-
+      pytest --run-slow -sv
+      tests/e2e/test_beam_v1_recall.py
+    artifact_paths: "v1_recall_results/**/*"
+
   - label: "Unit tests"
     key: unit-tests
     depends_on: upload-ready-pipeline

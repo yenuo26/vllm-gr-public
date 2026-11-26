@@ -79,7 +79,6 @@ def context(
     action: str = "synchronize",
     *,
     ready: bool = True,
-    abtest: bool = False,
     draft: bool = False,
     label: str = "",
     event: str = "pull_request",
@@ -103,11 +102,7 @@ def context(
                 "pull_request": {
                     "number": number,
                     "draft": draft,
-                    "labels": [
-                        {"name": name}
-                        for name, present in (("ready", ready), ("abtest", abtest))
-                        if present
-                    ],
+                    "labels": [{"name": "ready"}] if ready else [],
                     "base": {"ref": base_ref, "sha": "base-sha"},
                     "head": {
                         "ref": head_ref,
@@ -125,16 +120,14 @@ def evaluate(
     results: dict[str, str] | None = None,
     *,
     cancelled: bool = False,
-    ab_fresh: bool = False,
-    ab_passed: bool = False,
+    benchmark_device: str = "npu",
     docs_only: bool = False,
 ) -> Any:
     # Evaluate only the small expression subset used by these tracked workflow
     # guards. Keep the expressions in YAML as the source of truth.
     expression = expression.strip().removeprefix("${{").removesuffix("}}").strip()
     expression = expression.replace("github.event.pull_request.labels.*.name", "labels")
-    expression = expression.replace("needs.resolve-ab-freshness.outputs.fresh", "ab_fresh")
-    expression = expression.replace("needs.resolve-ab-freshness.outputs.passed", "ab_passed")
+    expression = expression.replace("needs.benchmark-policy.outputs.policy-json", "policy_json")
     expression = expression.replace("needs.docs-scope.outputs.docs-only", "docs_only")
     expression = re.sub(r"needs\.([\w-]+)\.result", r"results['\1']", expression)
     expression = expression.replace("&&", " and ").replace("||", " or ")
@@ -148,8 +141,8 @@ def evaluate(
             "github": github,
             "labels": [item["name"] for item in github.event.pull_request.labels],
             "results": results or {},
-            "ab_fresh": "True" if ab_fresh else "False",
-            "ab_passed": "True" if ab_passed else "False",
+            "policy_json": json.dumps({"BENCHMARK_DEVICE": benchmark_device}),
+            "fromJSON": lambda value: namespace(json.loads(value)),
             "docs_only": "True" if docs_only else "False",
             "always": lambda: True,
             "cancelled": lambda: cancelled,
@@ -185,7 +178,7 @@ class TestReadyLabelCI(unittest.TestCase):
         failed: str | None = None,
         *,
         cancelled: bool = False,
-        ab_fresh: bool = False,
+        benchmark_device: str = "npu",
         docs_only: bool = False,
     ) -> list[str]:
         results: dict[str, str] = {}
@@ -207,7 +200,7 @@ class TestReadyLabelCI(unittest.TestCase):
                     github,
                     results,
                     cancelled=cancelled,
-                    ab_fresh=ab_fresh,
+                    benchmark_device=benchmark_device,
                     docs_only=docs_only and results.get("docs-scope") == "success",
                 )
                 results[name] = (
@@ -256,7 +249,7 @@ class TestReadyLabelCI(unittest.TestCase):
                         ignored_label = action in {"labeled", "unlabeled"} and label != "ready"
                         self.assertEqual("benchmark-blocking" in running, not ignored_label)
                         gate_name = render(workflow["jobs"]["benchmark-blocking"]["name"], github)
-                        self.assertEqual(gate_name == "Benchmark blocking gate", not ignored_label)
+                        self.assertEqual(gate_name, "Benchmark blocking gate")
                     if "run-name" in workflow:
                         self.assertEqual(
                             render(workflow["run-name"], github).startswith("ci-meta:v1;"),
@@ -280,8 +273,7 @@ class TestReadyLabelCI(unittest.TestCase):
             github = context(event="workflow_dispatch", ready=False, draft=True)
             self.assertEqual(
                 set(self.scheduled(workflow, github)),
-                set(workflow["jobs"])
-                - {"beam-performance-ab-only", "resolve-ab-freshness", "docs-scope", "docs-check"},
+                set(workflow["jobs"]) - {"docs-scope", "docs-check"},
             )
 
     def test_label_edits_do_not_cancel_unrelated_runs(self) -> None:
@@ -303,49 +295,6 @@ class TestReadyLabelCI(unittest.TestCase):
                 second.run_id += 1
                 self.assertNotEqual(render(group, second), render(group, github))
 
-    def test_abtest_toggle_does_not_cancel_ready_validation(self) -> None:
-        workflow = self.workflows["ci.yml"]
-        group = workflow["concurrency"]["group"]
-        cancel = workflow["concurrency"]["cancel-in-progress"]
-        full = context("synchronize", ready=True, abtest=True)
-        added = context("labeled", ready=True, abtest=True, label="abtest")
-        removed = context("unlabeled", ready=True, abtest=False, label="abtest")
-
-        self.assertNotEqual(render(group, added), render(group, full))
-        self.assertFalse(evaluate(cancel, added))
-        # An active old run and pending full run share the full group; the
-        # A/B label event must not replace that pending full run.
-        older = copy.deepcopy(full)
-        older.run_id -= 1
-        self.assertEqual(render(group, older), render(group, full))
-        gpu_jobs = (
-            "pre-commit",
-            "decode-benchmark",
-            "beam-performance-ab-only",
-        )
-        for job_name in gpu_jobs:
-            gpu_lock = workflow["jobs"][job_name]["concurrency"]
-            self.assertEqual(render(gpu_lock["group"], full), render(gpu_lock["group"], added))
-            self.assertEqual(
-                render(gpu_lock["group"], full),
-                render(gpu_lock["group"], context(number=482, base_ref="main")),
-            )
-            self.assertEqual(
-                gpu_lock["group"], workflow["jobs"]["pre-commit"]["concurrency"]["group"]
-            )
-            self.assertEqual(gpu_lock["queue"], "max")
-            self.assertFalse(gpu_lock["cancel-in-progress"])
-        self.assertEqual(
-            self.scheduled(workflow, added),
-            ["docs-scope", "beam-performance-ab-only", "benchmark-blocking"],
-        )
-        self.assertNotEqual(render(group, removed), render(group, full))
-        self.assertEqual(self.scheduled(workflow, removed), [])
-        self.assertEqual(
-            render(workflow["jobs"]["benchmark-blocking"]["name"], removed),
-            "Ignored label event",
-        )
-
     def test_failed_validation_does_not_skip_blocking_gate(self) -> None:
         workflow = self.workflows["ci.yml"]
         if "benchmark-blocking" not in workflow["jobs"]:
@@ -357,11 +306,8 @@ class TestReadyLabelCI(unittest.TestCase):
     def test_blocking_gate_still_rejects_unsuccessful_checks(self) -> None:
         job = self.workflows["ci.yml"]["jobs"]["benchmark-blocking"]
         success = dict.fromkeys(job["needs"], "success")
-        success["beam-performance-ab-only"] = "skipped"
         scenarios = [(success, 0)]
         for variable in success.keys() - {
-            "beam-performance-ab-only",
-            "resolve-ab-freshness",
             "docs-scope",
             "docs-check",
         }:
@@ -369,13 +315,8 @@ class TestReadyLabelCI(unittest.TestCase):
                 scenarios.append(({**success, variable: status}, 1))
         for values, expected_code in scenarios:
             with self.subTest(values=values):
-                result = self.run_gate(values, ab_fresh=True, ab_passed=True)
+                result = self.run_gate(values)
                 self.assertEqual(result.returncode, expected_code, result.stdout + result.stderr)
-        self.assertEqual(self.run_gate(success, ab_fresh=False).returncode, 1)
-        self.assertEqual(
-            self.run_gate({**success, "beam-performance-ab-only": "success"}).returncode,
-            0,
-        )
 
     @pytest.mark.l1  # type: ignore[misc]
     def test_blocking_gate_names_the_root_cause_not_every_blocked_check(self) -> None:
@@ -385,35 +326,30 @@ class TestReadyLabelCI(unittest.TestCase):
         # sends reviewers after the wrong thing.
         job = self.workflows["ci.yml"]["jobs"]["benchmark-blocking"]
         success = dict.fromkeys(job["needs"], "success")
-        success["beam-performance-ab-only"] = "skipped"
         broken = {
             **success,
             "benchmark-policy": "failure",
             "pre-commit": "skipped",
             "decode-benchmark": "skipped",
         }
-        # A/B can also fail when no cached result exists. Report the failed
-        # prerequisite before the A/B freshness check in either case.
-        for fresh, ab_status in ((True, "skipped"), (False, "failure")):
-            broken["beam-performance-ab-only"] = ab_status
-            result = self.run_gate(broken, ab_fresh=fresh, ab_passed=fresh)
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            errors = [line for line in result.stdout.splitlines() if "::error::" in line]
-            self.assertTrue(errors, result.stdout)
-            # The first annotation must be the root cause, not a blocked check. The
-            # gate reports the result variables it evaluates, not the job identifiers.
-            self.assertIn("POLICY_RESULT", errors[0])
-            for blocked in (
-                "PRE_COMMIT_RESULT",
-                "DECODE_RESULT",
-            ):
-                self.assertNotIn(
-                    f"{blocked} did not pass",
-                    " ".join(errors),
-                    "blocked checks must not be reported as failures",
-                )
-            # Exactly one annotation per group: the failure and the blocked set.
-            self.assertLessEqual(len(errors), 2, "\n".join(errors))
+        result = self.run_gate(broken)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        errors = [line for line in result.stdout.splitlines() if "::error::" in line]
+        self.assertTrue(errors, result.stdout)
+        # The first annotation must be the root cause, not a blocked check. The
+        # gate reports the result variables it evaluates, not the job identifiers.
+        self.assertIn("POLICY_RESULT", errors[0])
+        for blocked in (
+            "PRE_COMMIT_RESULT",
+            "DECODE_RESULT",
+        ):
+            self.assertNotIn(
+                f"{blocked} did not pass",
+                " ".join(errors),
+                "blocked checks must not be reported as failures",
+            )
+        # Exactly one annotation per group: the failure and the blocked set.
+        self.assertLessEqual(len(errors), 2, "\n".join(errors))
 
     @pytest.mark.l1  # type: ignore[misc]
     def test_blocking_gate_reports_pure_skips_as_unrun_not_failed(self) -> None:
@@ -422,180 +358,41 @@ class TestReadyLabelCI(unittest.TestCase):
         # failure.
         job = self.workflows["ci.yml"]["jobs"]["benchmark-blocking"]
         success = dict.fromkeys(job["needs"], "success")
-        success["beam-performance-ab-only"] = "skipped"
         skipped = {**success, "benchmark-policy": "skipped", "pre-commit": "skipped"}
-        result = self.run_gate(skipped, ab_fresh=True, ab_passed=True)
+        result = self.run_gate(skipped)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         errors = [line for line in result.stdout.splitlines() if "::error::" in line]
         self.assertTrue(errors, result.stdout)
         self.assertIn("did not run", errors[0])
         self.assertNotIn("failed and blocked", " ".join(errors))
 
-    def test_ab_only_has_separate_check_and_does_not_run_on_drafts(self) -> None:
-        workflow = self.workflows["ci.yml"]
-        gate = workflow["jobs"]["benchmark-blocking"]
-        for ready in (False, True):
-            github = context("labeled", ready=ready, abtest=True, label="abtest")
-            running = self.scheduled(workflow, github)
-            self.assertEqual(
-                running, ["docs-scope", "beam-performance-ab-only", "benchmark-blocking"]
-            )
-            self.assertEqual(render(gate["name"], github), "Beam V1 performance A/B gate")
-            results = {need: "success" if need in running else "skipped" for need in gate["needs"]}
-            self.assertEqual(self.run_gate(results, github).returncode, 0)
-
-        draft = context("labeled", ready=True, abtest=True, draft=True, label="abtest")
-        running = self.scheduled(workflow, draft)
-        self.assertEqual(running, ["benchmark-blocking"])
-        self.assertEqual(render(gate["name"], draft), "Beam V1 performance A/B gate")
-        results = dict.fromkeys(gate["needs"], "skipped")
-        self.assertEqual(self.run_gate(results, draft).returncode, 1)
-
-    def test_docs_only_skips_ab(self) -> None:
+    def test_docs_only_runs_the_docs_gate(self) -> None:
         workflow = self.workflows["ci.yml"]
         for event in (
-            context("synchronize", ready=True, abtest=True),
-            context("labeled", ready=True, abtest=True, label="ready"),
+            context("synchronize", ready=True),
+            context("labeled", ready=True, label="ready"),
         ):
             with self.subTest(action=event.event.action):
-                running = self.scheduled(workflow, event, docs_only=True)
-                self.assertEqual(running, ["docs-scope", "docs-check", "benchmark-blocking"])
-
-        for ready in (False, True):
-            with self.subTest(ready=ready):
-                event = context("labeled", ready=ready, abtest=True, label="abtest")
-                self.assertEqual(self.scheduled(workflow, event, docs_only=True), ["docs-scope"])
-                # Failed or uncertain classification preserves the explicit A/B path.
                 self.assertEqual(
-                    self.scheduled(workflow, event, docs_only=False),
-                    ["docs-scope", "beam-performance-ab-only", "benchmark-blocking"],
-                )
-                self.assertEqual(
-                    self.scheduled(workflow, event, failed="docs-scope", docs_only=True),
-                    ["docs-scope", "beam-performance-ab-only", "benchmark-blocking"],
+                    self.scheduled(workflow, event, docs_only=True),
+                    ["docs-scope", "docs-check", "benchmark-blocking"],
                 )
 
-    def test_docs_gate_requires_docs_checks_and_ignores_ab_results(self) -> None:
-        workflow = self.workflows["ci.yml"]
-        gate = workflow["jobs"]["benchmark-blocking"]
-        event = context("synchronize", ready=True, abtest=True)
+    def test_docs_gate_requires_docs_checks(self) -> None:
+        gate = self.workflows["ci.yml"]["jobs"]["benchmark-blocking"]
         results = dict.fromkeys(gate["needs"], "skipped")
         results.update({"docs-scope": "success", "docs-check": "success"})
-        for fresh, passed in ((False, False), (True, False), (True, True)):
-            result = self.run_gate(results, event, docs_only=True, ab_fresh=fresh, ab_passed=passed)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.run_gate(results, docs_only=True).returncode, 0)
         for status in ("failure", "cancelled", "skipped"):
-            result = self.run_gate({**results, "docs-check": status}, event, docs_only=True)
+            result = self.run_gate({**results, "docs-check": status}, docs_only=True)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-
-    def test_ab_only_code_update_and_ready_removal_do_not_pass_full_gate(self) -> None:
-        workflow = self.workflows["ci.yml"]
-        gate = workflow["jobs"]["benchmark-blocking"]
-        results = dict.fromkeys(gate["needs"], "skipped")
-        for github, expected_name in (
-            (
-                context("synchronize", ready=False, abtest=True),
-                "Beam V1 performance A/B gate",
-            ),
-            (
-                context("unlabeled", ready=False, abtest=True, label="ready"),
-                "Benchmark blocking gate",
-            ),
-        ):
-            self.assertEqual(self.scheduled(workflow, github), ["benchmark-blocking"])
-            self.assertEqual(render(gate["name"], github), expected_name)
-            self.assertEqual(self.run_gate(results, github).returncode, 1)
-
-        ready = context("labeled", ready=True, abtest=True, label="ready")
-        running = self.scheduled(workflow, ready)
-        self.assertIn("beam-performance-ab-only", running)
-        self.assertNotIn("beam-performance-ab-only", self.scheduled(workflow, ready, ab_fresh=True))
-        self.assertEqual(render(gate["name"], ready), "Benchmark blocking gate")
-
-    def test_ready_reuses_fresh_ab_and_reruns_stale_ab(self) -> None:
-        workflow = self.workflows["ci.yml"]
-        ready = context("labeled", ready=True, label="ready")
-        for fresh in (False, True):
-            with self.subTest(fresh=fresh):
-                running = self.scheduled(workflow, ready, ab_fresh=fresh)
-                self.assertIn("resolve-ab-freshness", running)
-                self.assertEqual("beam-performance-ab-only" in running, not fresh)
-                results = {
-                    need: "success" if need in running else "skipped"
-                    for need in workflow["jobs"]["benchmark-blocking"]["needs"]
-                }
-                self.assertEqual(
-                    self.run_gate(results, ready, ab_fresh=fresh, ab_passed=fresh).returncode,
-                    0,
-                )
-        fresh_results = dict.fromkeys(workflow["jobs"]["benchmark-blocking"]["needs"], "success")
-        fresh_results["beam-performance-ab-only"] = "skipped"
-        self.assertEqual(self.run_gate(fresh_results, ready, ab_fresh=True).returncode, 1)
-
-    def test_ab_freshness_lookup_accepts_only_current_revision(self) -> None:
-        if shutil.which("node") is None:
-            self.skipTest("Node.js is required to exercise the github-script lookup")
-        step = self.workflows["ci.yml"]["jobs"]["resolve-ab-freshness"]["steps"][0]
-        harness = """
-const fixture = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-const outputs = {};
-const context = {
-  repo: {owner: 'owner', repo: 'repo'},
-  payload: {pull_request: {
-    number: 481, head: {sha: 'current-head'},
-    base: {ref: 'main', sha: 'base-sha'},
-  }},
-  sha: 'current-merge', runId: 124,
-};
-const github = {rest: {actions: {
-  listWorkflowRuns: async () => ({data: {workflow_runs: [fixture.run]}}),
-  listJobsForWorkflowRun: async () => ({data: {jobs: [
-    {name: 'Beam V1 performance A/B only', conclusion: 'success'},
-  ]}}),
-  listWorkflowRunArtifacts: async () => ({data: {artifacts: [
-    {name: 'beam-v1-performance-report-123-1', expired: false},
-  ]}}),
-}}};
-const core = {
-  setOutput: (key, value) => { outputs[key] = value; },
-  warning: () => {}, info: () => {},
-};
-const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
-new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, core)
-  .then(() => process.stdout.write(JSON.stringify(outputs)))
-  .catch(error => { console.error(error); process.exitCode = 1; });
-"""
-        for current in (False, True):
-            with self.subTest(current=current):
-                revision = "current" if current else "old"
-                fixture = {
-                    "script": step["with"]["script"],
-                    "run": {
-                        "id": 123,
-                        "status": "completed",
-                        "conclusion": "success",
-                        "head_sha": f"{revision}-head",
-                        "display_title": f"pull_request:481/merge@{revision}-merge",
-                        "run_attempt": 1,
-                    },
-                }
-                result = run_workflow_command(
-                    ["node", "-e", harness],
-                    input=json.dumps(fixture),
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(
-                    json.loads(result.stdout),
-                    {"fresh": str(current).lower(), "passed": str(current).lower()},
-                )
 
     def run_gate(
         self,
         results: dict[str, str],
         github: Any | None = None,
         *,
-        ab_fresh: bool = False,
-        ab_passed: bool = False,
+        benchmark_device: str = "npu",
         docs_only: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         steps = self.workflows["ci.yml"]["jobs"]["benchmark-blocking"]["steps"]
@@ -609,8 +406,7 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
                     value,
                     github,
                     results,
-                    ab_fresh=ab_fresh,
-                    ab_passed=ab_passed,
+                    benchmark_device=benchmark_device,
                     docs_only=docs_only,
                 )
             ).lower()
@@ -621,60 +417,21 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
             env=env,
         )
 
-    def test_main_ab_routing(self) -> None:
+    def test_pr_decode_routing(self) -> None:
         workflow = self.workflows["ci.yml"]
         gate = workflow["jobs"]["benchmark-blocking"]
-        group = workflow["concurrency"]["group"]
-        cancel = workflow["concurrency"]["cancel-in-progress"]
-        full = context("synchronize", ready=True)
-        ready = context("labeled", ready=True, label="ready")
-        ab_only = context("labeled", ready=True, abtest=True, label="abtest")
-        removed = context("unlabeled", ready=True, label="abtest")
-        self.assertNotEqual(render(group, full), render(group, ab_only))
-        self.assertFalse(evaluate(cancel, ab_only))
-        self.assertEqual(
-            self.scheduled(workflow, ab_only),
-            ["docs-scope", "beam-performance-ab-only", "benchmark-blocking"],
-        )
-        self.assertEqual(render(gate["name"], ab_only), "Beam V1 performance A/B gate")
-        self.assertEqual(self.scheduled(workflow, removed), [])
-        for status, expected in (("success", 0), ("failure", 1), ("skipped", 1)):
-            results = dict.fromkeys(gate["needs"], "skipped")
-            results["beam-performance-ab-only"] = status
-            self.assertEqual(self.run_gate(results, ab_only).returncode, expected)
-        unready_update = context("synchronize", ready=False, abtest=True)
-        self.assertEqual(self.scheduled(workflow, unready_update), ["benchmark-blocking"])
-        self.assertEqual(render(gate["name"], unready_update), "Beam V1 performance A/B gate")
-        self.assertEqual(
-            self.run_gate(dict.fromkeys(gate["needs"], "skipped"), unready_update).returncode,
-            1,
-        )
-        for event in (full, ready):
-            for fresh in (False, True):
-                running = self.scheduled(workflow, event, ab_fresh=fresh)
-                self.assertIn("resolve-ab-freshness", running)
-                self.assertIn("benchmark-policy", running)
-                self.assertIn("pre-commit", running)
-                self.assertIn("decode-benchmark", running)
-                self.assertEqual("beam-performance-ab-only" in running, not fresh)
-                results = {
-                    need: "success" if need in running else "skipped" for need in gate["needs"]
-                }
-                self.assertEqual(
-                    self.run_gate(results, event, ab_fresh=fresh, ab_passed=fresh).returncode,
-                    0,
-                )
-                if fresh:
-                    self.assertEqual(self.run_gate(results, event, ab_fresh=True).returncode, 1)
-        for event in (
-            context("opened", ready=False),
-            context("unlabeled", ready=False, label="ready"),
-            context("converted_to_draft", draft=True),
-        ):
-            self.assertEqual(self.scheduled(workflow, event), ["benchmark-blocking"])
+        event = context("synchronize", ready=True)
+        for action in ("labeled", "unlabeled"):
             self.assertEqual(
-                self.run_gate(dict.fromkeys(gate["needs"], "skipped"), event).returncode, 1
+                self.scheduled(workflow, context(action, ready=True, label="abtest")), []
             )
+        for device in ("gpu", "npu"):
+            with self.subTest(device=device):
+                running = self.scheduled(workflow, event, benchmark_device=device)
+                self.assertEqual("decode-benchmark" in running, device == "npu")
+                results = {job: "success" if job in running else "skipped" for job in gate["needs"]}
+                result = self.run_gate(results, event, benchmark_device=device)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_recall_and_decode_benchmark_cover_both_target_branches_and_devices(self) -> None:
         steps = self.workflows["ci.yml"]["jobs"]["decode-benchmark"]["steps"]
@@ -883,7 +640,9 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
         self.assertTrue(
             {"pre-commit", "decode-benchmark"} <= set(jobs["benchmark-blocking"]["needs"])
         )
-        self.assertIn("beam-performance-ab-only", jobs)
+        self.assertNotIn("beam-performance-ab-only", jobs)
+        ready = yaml.safe_load((ROOT / ".buildkite/test-ready.yml").read_text())
+        self.assertIn("beam-v1-performance-ab", {step["key"] for step in ready["steps"]})
         local_runner = (ROOT / "tools/pre_commit/run_tests.sh").read_text()
         self.assertIn("VLLM_GR_TEST_LEVEL", local_runner)
         self.assertIn(

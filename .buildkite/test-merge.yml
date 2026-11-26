@@ -2,6 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 steps:
+  - label: "Beam V1 performance baseline"
+    key: beam-v1-performance-baseline
+    depends_on: upload-merge-pipeline
+    timeout_in_minutes: 180
+    mirror_hardwares: l4_1
+    command: |-
+      bash -euo pipefail <<'BASH'
+      commit_sha="$${BUILDKITE_COMMIT:?Buildkite commit is required}"
+      repository="public.ecr.aws/q9t5s3a7/vllm-ci-test-repo"
+      export V1_PERF_OUTPUT_DIR="beam-v1-baselines/$$commit_sha"
+      pytest --run-slow -sv \
+        'tests/e2e/test_beam_v1_performance.py::test_beam_v1_performance[baseline]'
+      cd "$$V1_PERF_OUTPUT_DIR/public"
+      aws ecr-public get-login-password --region us-east-1 |
+        oras push --username AWS --password-stdin \
+          "$$repository:vllm-gr-beam-v1-baseline-$$commit_sha" \
+          baseline.tar.gz:application/gzip
+      BASH
+
   - label: "Unit tests"
     key: merge-unit-tests
     depends_on: upload-merge-pipeline

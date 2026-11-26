@@ -3,9 +3,14 @@
 
 FROM vllm/vllm-openai:v0.30.0
 
+COPY --from=ghcr.io/oras-project/oras:v1.2.2 /bin/oras /usr/local/bin/oras
+COPY --from=public.ecr.aws/aws-cli/aws-cli:2.27.41 /usr/local/aws-cli/ /usr/local/aws-cli/
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws \
+    && aws --version
 
 # Shell-based tests also invoke Python through the unversioned command.
 RUN if ! command -v python >/dev/null 2>&1; then \
